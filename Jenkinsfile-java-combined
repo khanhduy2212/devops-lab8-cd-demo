@@ -1,0 +1,129 @@
+// Lab 8 Bonus 5.3 - JAVA + MAVEN (Lab 7 source) -> DOCKER CD.
+// This is a separate Jenkins Job; it does NOT change existing jobs.
+pipeline {
+    agent any
+
+    tools {
+        maven 'M3'
+    }
+
+    environment {
+        DOCKER_USER    = 'khanhduy22'
+        DOCKER_IMAGE   = 'khanhduy22/devops-lab8-java'
+        CONTAINER_NAME = 'lab8-java-cicd'
+        APP_PORT       = '3004'
+    }
+
+    stages {
+        stage('CI: Build') {
+            steps {
+                dir('java-bonus') {
+                    sh 'mvn -B clean compile'
+                }
+            }
+        }
+
+        stage('CI: Test') {
+            steps {
+                dir('java-bonus') {
+                    sh 'mvn -B test'
+                }
+            }
+            post {
+                always {
+                    junit testResults: 'java-bonus/target/surefire-reports/*.xml',
+                          allowEmptyResults: false
+                }
+            }
+        }
+
+        stage('CI: Package') {
+            steps {
+                dir('java-bonus') {
+                    sh 'mvn -B package -DskipTests'
+                }
+                archiveArtifacts artifacts: 'java-bonus/target/*.jar', fingerprint: true
+            }
+        }
+
+        stage('CD: Docker Build') {
+            steps {
+                sh '''
+                    set -eu
+                    docker build \
+                        -f java-bonus/Dockerfile \
+                        -t "$DOCKER_IMAGE:$BUILD_NUMBER" \
+                        java-bonus
+                '''
+            }
+        }
+
+        stage('CD: Push') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'docker-hub-credentials_1',
+                        usernameVariable: 'HUB_USER',
+                        passwordVariable: 'HUB_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        test "$HUB_USER" = "$DOCKER_USER"
+                        export DOCKER_CONFIG="$(mktemp -d)"
+                        trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+                        printf '%s' "$HUB_TOKEN" | docker login \
+                            -u "$HUB_USER" --password-stdin
+                        docker push "$DOCKER_IMAGE:$BUILD_NUMBER"
+                    '''
+                }
+            }
+        }
+
+        stage('CD: Deploy') {
+            steps {
+                sh '''
+                    set -eu
+                    docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+                    docker run -d \
+                        --name "$CONTAINER_NAME" \
+                        -p "$APP_PORT:8080" \
+                        --restart unless-stopped \
+                        "$DOCKER_IMAGE:$BUILD_NUMBER"
+                '''
+            }
+        }
+
+        stage('CD: Verify') {
+            steps {
+                sh '''
+                    set -eu
+                    for i in 1 2 3 4 5 6 7 8 9 10; do
+                        if curl -fsS "http://host.docker.internal:$APP_PORT/health"; then
+                            echo ''
+                            curl -fsS "http://host.docker.internal:$APP_PORT/api/calculate?op=add&a=10&b=5"
+                            echo ''
+                            exit 0
+                        fi
+                        echo "Waiting for Java application: $i/10"
+                        sleep 2
+                    done
+                    docker logs "$CONTAINER_NAME" || true
+                    exit 1
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'JAVA + MAVEN CI/CD SUCCESS: build, test, package, Docker push/deploy/verify'
+        }
+        failure {
+            echo 'JAVA + MAVEN CI/CD FAILED: inspect Console Output'
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
